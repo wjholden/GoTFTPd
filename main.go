@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
 )
 
 func main() {
@@ -56,40 +58,112 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 	case 1:
 		fmt.Println("read request from ", addr.String(), filename, mode)
 
-		var buf bytes.Buffer
-
-		buf.Write([]byte{0, 3}) // TFTP data packet
-		buf.Write([]byte{0, 1}) // block #1
-		buf.WriteString("Hello world!")
-		conn.Write(buf.Bytes())
+		_ = send(filename, conn)
 	case 2:
 		fmt.Println("write request from ", addr.String())
 
-		var buf bytes.Buffer
+		_ = receive(filename, conn)
+	}
+}
 
-		buf.Write([]byte{0, 4}) // TFTP ack packet
-		buf.Write([]byte{0, 0}) // block #0
-		conn.Write(buf.Bytes())
+func receive(filename string, conn *net.UDPConn) error {
+	_ = filename
 
-		for {
-			// we've acknowledged that we will accept the file, so now receive it.
-			read_buffer := make([]byte, 1500)
-			n, _ := conn.Read(read_buffer)
+	tftpSendAck(0, conn)
 
-			block := binary.BigEndian.Uint16(read_buffer[2:4])
-			fmt.Printf("Read block %d (%d bytes): ", block, n)
-			fmt.Println(string(read_buffer[4:]))
+	for {
+		// we've acknowledged that we will accept the file, so now receive it.
+		read_buffer := make([]byte, 1500)
+		n, _ := conn.Read(read_buffer)
 
-			// we've received, now acknowledge receipt.
-			buf.Reset()
-			buf.Write([]byte{0, 4})
-			buf.Write([]byte{byte(0xff & (block >> 8)), byte(0xff & block)})
-			conn.Write(buf.Bytes())
-			fmt.Println(buf.Bytes())
+		block := binary.BigEndian.Uint16(read_buffer[2:4])
+		fmt.Print(string(read_buffer[4:]))
 
-			if n < 512+2+2 {
-				break
-			}
+		// we've received, now acknowledge receipt.
+		tftpSendAck(block, conn)
+
+		if n < 512+2+2 {
+			break
 		}
 	}
+
+	return nil
+}
+
+func send(filename string, conn *net.UDPConn) error {
+	var buf bytes.Buffer
+
+	file, err := os.Open(filename)
+	if err != nil {
+		tftpSendError(err, conn)
+		return err
+	}
+	defer file.Close()
+
+	write_buffer := make([]byte, 512)
+	for i := uint16(1); ; {
+		n, err := file.ReadAt(write_buffer, int64((i-1)*512))
+		if err != nil && err != io.EOF {
+			tftpSendError(err, conn)
+			return err
+		}
+		buf.Write([]byte{0, 3})                                  // TFTP data packet
+		buf.Write([]byte{byte(0xff & (i >> 8)), byte(0xff & i)}) // block #
+		buf.Write(write_buffer[:n])
+		conn.Write(buf.Bytes())
+		buf.Reset()
+
+		block, err := tftpReceiveAck(conn)
+		if err != nil {
+			fmt.Println(err)
+			continue
+		} else if block == i {
+			i++
+		}
+
+		if n == 0 || err == io.EOF {
+			break
+		}
+	}
+
+	return nil
+}
+
+func tftpSendError(err error, conn *net.UDPConn) {
+	var buf bytes.Buffer
+	buf.Write([]byte{0, 5, 0, 0}) // TFTP error packet with no defined error code
+	buf.Write([]byte(fmt.Sprint(err)))
+	conn.Write(buf.Bytes())
+}
+
+func tftpReceiveAck(conn *net.UDPConn) (block uint16, err error) {
+	read_buffer := make([]byte, 1500)
+	n, _, err := conn.ReadFrom(read_buffer)
+	if err != nil {
+		return
+	}
+
+	if n != 4 {
+		err = fmt.Errorf("ack length is not 4 bytes (actual: %d)", n)
+		return
+	}
+
+	opcode := binary.BigEndian.Uint16(read_buffer[:2])
+	switch opcode {
+	case 4:
+		block = binary.BigEndian.Uint16(read_buffer[2:4])
+	case 5:
+		err = fmt.Errorf(string(read_buffer[4:]))
+	default:
+		err = fmt.Errorf("unexpected opcode=%d", opcode)
+	}
+
+	return
+}
+
+func tftpSendAck(block uint16, conn *net.UDPConn) {
+	var buf bytes.Buffer
+	buf.Write([]byte{0, 4})
+	buf.Write([]byte{byte(0xff & (block >> 8)), byte(0xff & block)})
+	conn.Write(buf.Bytes())
 }
