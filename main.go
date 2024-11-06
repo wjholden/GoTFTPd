@@ -11,6 +11,11 @@ import (
 	"strconv"
 )
 
+// https://datatracker.ietf.org/doc/html/rfc1350
+// https://datatracker.ietf.org/doc/html/rfc1785
+// https://datatracker.ietf.org/doc/html/rfc1784
+// https://datatracker.ietf.org/doc/html/rfc2347
+// https://datatracker.ietf.org/doc/html/rfc2349
 func main() {
 	fmt.Println("Starting TFTP server...")
 	laddr := &net.UDPAddr{IP: net.IPv6zero, Port: 69, Zone: ""}
