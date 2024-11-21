@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"time"
 )
 
 // https://datatracker.ietf.org/doc/html/rfc1350
@@ -111,9 +112,25 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 }
 
 func receive(filename string, conn *net.UDPConn, blocksize int) error {
-	_ = filename
+	var prefixed_filename = "./" + filename // force relative path, is this enough?
 
+	if _, err := os.Stat(prefixed_filename); err == nil {
+		// file already exists
+		err = fmt.Errorf("%s already exists", filename)
+		tftpSendError(err, 6, conn)
+		return err
+	}
+
+	start_time := time.Now()
 	tftpSendAck(0, conn)
+
+	f, err := os.Create(prefixed_filename)
+	if err != nil {
+		tftpSendError(err, 0, conn)
+		return err
+	}
+	defer f.Close()
+	fmt.Printf("Receiving %s...\n", filename)
 
 	for {
 		// we've acknowledged that we will accept the file, so now receive it.
@@ -121,7 +138,8 @@ func receive(filename string, conn *net.UDPConn, blocksize int) error {
 		n, _ := conn.Read(read_buffer)
 
 		block := binary.BigEndian.Uint16(read_buffer[2:4])
-		fmt.Print(string(read_buffer[4:]))
+		//fmt.Print(string(read_buffer[4:n]))
+		f.Write(read_buffer[4:n])
 
 		// we've received, now acknowledge receipt.
 		tftpSendAck(block, conn)
@@ -130,6 +148,7 @@ func receive(filename string, conn *net.UDPConn, blocksize int) error {
 			break
 		}
 	}
+	fmt.Printf("Wrote %s in %s.\n", prefixed_filename, time.Since(start_time).String())
 
 	return nil
 }
