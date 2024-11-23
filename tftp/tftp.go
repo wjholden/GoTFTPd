@@ -17,6 +17,29 @@ import (
 var discard_data bool = false
 var read_only bool = false
 
+type ErrorCode uint16
+
+const (
+	ERR_UNDEFINED        ErrorCode = 0
+	ERR_NOT_FOUND        ErrorCode = 1
+	ERR_ACCESS_VIOLATION ErrorCode = 2
+	ERR_DISK_FULL        ErrorCode = 3
+	ERR_ILLEGAL_OP       ErrorCode = 4
+	ERR_UNKNOWN_TID      ErrorCode = 5
+	ERR_ALREADY_EXISTS   ErrorCode = 6
+	ERR_NO_SUCH_USER     ErrorCode = 7
+)
+
+type OpCode uint16
+
+const (
+	OPCODE_RRQ   OpCode = 1
+	OPCODE_WRQ   OpCode = 2
+	OPCODE_DATA  OpCode = 3
+	OPCODE_ACK   OpCode = 4
+	OPCODE_ERROR OpCode = 5
+)
+
 // https://datatracker.ietf.org/doc/html/rfc1350
 // https://datatracker.ietf.org/doc/html/rfc1785
 // https://datatracker.ietf.org/doc/html/rfc1784
@@ -54,7 +77,7 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 	defer conn.Close()
 
 	// identify the request type
-	opcode := binary.BigEndian.Uint16(req[0:2])
+	opcode := OpCode(binary.BigEndian.Uint16(req[0:2]))
 
 	req_strings := bytes.Split(req[2:], []byte{0})
 	if len(req_strings[len(req_strings)-1]) == 0 {
@@ -62,7 +85,7 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 	}
 
 	if len(req_strings) < 2 {
-		tftpSendError(fmt.Errorf("request missing filename or mode"), 4, conn)
+		tftpSendError(fmt.Errorf("request missing filename or mode"), ERR_ILLEGAL_OP, conn)
 		return
 	}
 
@@ -99,7 +122,7 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 			}
 
 			if err != nil {
-				tftpSendError(err, 0, conn)
+				tftpSendError(err, ERR_UNDEFINED, conn)
 				fmt.Println(" (error)")
 			} else {
 				options[key] = value
@@ -109,7 +132,7 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 	}
 
 	switch opcode {
-	case 1:
+	case OPCODE_RRQ:
 		fmt.Println("read request from", addr.String(), filename, mode)
 
 		tftpSendOptionsAck(&options, opcode, conn)
@@ -118,10 +141,10 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 		if err != nil {
 			fmt.Println("Error sending:", err)
 		}
-	case 2:
+	case OPCODE_WRQ:
 		if read_only {
 			err = fmt.Errorf("this server is read-only")
-			tftpSendError(err, 2, conn)
+			tftpSendError(err, ERR_ACCESS_VIOLATION, conn)
 			fmt.Println("Rejected write from", addr.String(), "(server is in read-only mode).")
 			return
 		}
@@ -134,8 +157,13 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 		if err != nil {
 			fmt.Println("Error receiving:", err)
 		}
+	case OPCODE_DATA, OPCODE_ACK:
+		// We've received a data or acknowledgement that isn't consistent
+		// with the server's state.
+		tftpSendError(fmt.Errorf("who are you?"), ERR_UNKNOWN_TID, conn)
+		return
 	default:
-		tftpSendError(fmt.Errorf("unexpected opcode (%d)", opcode), 4, conn)
+		tftpSendError(fmt.Errorf("unexpected opcode (%d)", opcode), ERR_ILLEGAL_OP, conn)
 		return
 	}
 }
@@ -147,7 +175,7 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 		// file already exists
 		err = fmt.Errorf("%s already exists", filename)
 		fmt.Println(err)
-		tftpSendError(err, 6, conn)
+		tftpSendError(err, ERR_ALREADY_EXISTS, conn)
 		return err
 	}
 
@@ -161,7 +189,7 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 	if !discard_data {
 		file, err := os.Create(prefixed_filename)
 		if err != nil {
-			tftpSendError(err, 0, conn)
+			tftpSendError(err, ERR_UNDEFINED, conn)
 			return err
 		}
 		defer file.Close()
@@ -199,7 +227,7 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 
 			if err != nil {
 				fmt.Println(err)
-				tftpSendError(err, 0, conn)
+				tftpSendError(err, ERR_UNDEFINED, conn)
 				continue
 			}
 
@@ -220,7 +248,7 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 			err = fmt.Errorf("received %s block %d, expected %d",
 				filename, block, blocks_read+1)
 			fmt.Println(err)
-			tftpSendError(err, 0, conn)
+			tftpSendError(err, ERR_UNDEFINED, conn)
 			continue
 		}
 	}
@@ -252,7 +280,7 @@ func send(filename string, conn *net.UDPConn, blocksize int) error {
 	prefixed_filename := "./" + filename
 	file, err := os.Open(prefixed_filename)
 	if err != nil {
-		tftpSendError(err, 1, conn)
+		tftpSendError(err, ERR_NOT_FOUND, conn)
 		return err
 	}
 	defer file.Close()
@@ -268,7 +296,7 @@ func send(filename string, conn *net.UDPConn, blocksize int) error {
 		n, err := file.ReadAt(write_buffer, int64((i-1))*int64(blocksize))
 		if err != nil && err != io.EOF {
 			fmt.Printf("I/O problem during transfer: %s.", err)
-			tftpSendError(err, 0, conn)
+			tftpSendError(err, ERR_UNDEFINED, conn)
 			return err
 		}
 		buf.Write([]byte{0, 3})                         // TFTP data packet
@@ -321,7 +349,7 @@ func speed(bytes int, start time.Time) (rate float64, unit string) {
 	return
 }
 
-func tftpSendError(err error, errcode uint16, conn *net.UDPConn) {
+func tftpSendError(err error, errcode ErrorCode, conn *net.UDPConn) {
 	var buf bytes.Buffer
 	buf.Write([]byte{0, 5, byte(errcode >> 8), byte(errcode & 0xff)}) // TFTP error packet with no defined error code
 	buf.Write([]byte(fmt.Sprint(err)))
@@ -340,11 +368,11 @@ func tftpReceiveAck(conn *net.UDPConn) (block uint16, err error) {
 		return
 	}
 
-	opcode := binary.BigEndian.Uint16(read_buffer[:2])
+	opcode := OpCode(binary.BigEndian.Uint16(read_buffer[:2]))
 	switch opcode {
-	case 4:
+	case OPCODE_ACK:
 		block = binary.BigEndian.Uint16(read_buffer[2:4])
-	case 5:
+	case OPCODE_ERROR:
 		err = fmt.Errorf("received TFTP error from %s: %s", conn.RemoteAddr().String(), string(read_buffer[4:]))
 	default:
 		err = fmt.Errorf("unexpected opcode=%d", opcode)
@@ -360,7 +388,7 @@ func tftpSendAck(block uint16, conn *net.UDPConn) {
 	conn.Write(buf.Bytes())
 }
 
-func tftpSendOptionsAck(options *map[string]string, opcode uint16, conn *net.UDPConn) {
+func tftpSendOptionsAck(options *map[string]string, opcode OpCode, conn *net.UDPConn) {
 	if len(*options) == 0 {
 		return
 	}
@@ -376,7 +404,7 @@ func tftpSendOptionsAck(options *map[string]string, opcode uint16, conn *net.UDP
 	}
 	conn.Write(buf.Bytes())
 
-	if opcode == 1 {
+	if opcode == OPCODE_RRQ {
 		zero, err := tftpReceiveAck(conn)
 		if zero != 0 {
 			err = fmt.Errorf("client did not acknowledge acknlowledged option")
