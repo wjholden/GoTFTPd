@@ -15,14 +15,16 @@ import (
 )
 
 var discard_data bool = false
+var read_only bool = false
 
 // https://datatracker.ietf.org/doc/html/rfc1350
 // https://datatracker.ietf.org/doc/html/rfc1785
 // https://datatracker.ietf.org/doc/html/rfc1784
 // https://datatracker.ietf.org/doc/html/rfc2347
 // https://datatracker.ietf.org/doc/html/rfc2349
-func Listen(discard bool, port int) {
+func Listen(discard bool, port int, readonly bool) {
 	discard_data = discard
+	read_only = readonly
 	fmt.Println("Starting TFTP server...")
 	laddr := &net.UDPAddr{IP: net.IPv6zero, Port: port, Zone: ""}
 	conn, err := net.ListenUDP("udp", laddr)
@@ -106,34 +108,27 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 		}
 	}
 
-	if len(options) > 0 {
-		tftpSendOptionsAck(&options, conn)
-
-		// RFC 2347: If the transfer was initiated with a Read Request, then an
-		// ACK (with the data block	number set to 0) is sent by the client to
-		// confirm the values in the server's OACK packet.
-		if opcode == 1 {
-			zero, err := tftpReceiveAck(conn)
-			if zero != 0 {
-				err = fmt.Errorf("client did not acknowledge acknlowledged option")
-			}
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-		}
-	}
-
 	switch opcode {
 	case 1:
 		fmt.Println("read request from", addr.String(), filename, mode)
+
+		tftpSendOptionsAck(&options, opcode, conn)
 
 		err = send(filename, conn, blocksize)
 		if err != nil {
 			fmt.Println("Error sending:", err)
 		}
 	case 2:
+		if read_only {
+			err = fmt.Errorf("this server is read-only")
+			tftpSendError(err, 2, conn)
+			fmt.Println("Rejected write from", addr.String(), "(server is in read-only mode).")
+			return
+		}
+
 		fmt.Println("write request from", addr.String())
+
+		tftpSendOptionsAck(&options, opcode, conn)
 
 		err = receive(filename, conn, blocksize, timeout)
 		if err != nil {
@@ -232,7 +227,14 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 
 	fmt.Println("\033[34m") // blue
 	speed_rate, speed_unit := speed(bytes_read, start_time)
-	fmt.Printf("Wrote %s from %s (%.2f %s)\n",
+	var verb string
+	if discard_data {
+		verb = "Discarded"
+	} else {
+		verb = "Wrote"
+	}
+	fmt.Printf("%s %s from %s (%.2f %s)\n",
+		verb,
 		prefixed_filename,
 		conn.RemoteAddr().String(),
 		speed_rate,
@@ -358,7 +360,11 @@ func tftpSendAck(block uint16, conn *net.UDPConn) {
 	conn.Write(buf.Bytes())
 }
 
-func tftpSendOptionsAck(options *map[string]string, conn *net.UDPConn) {
+func tftpSendOptionsAck(options *map[string]string, opcode uint16, conn *net.UDPConn) {
+	if len(*options) == 0 {
+		return
+	}
+
 	// https://datatracker.ietf.org/doc/html/rfc2347
 	var buf bytes.Buffer
 	buf.Write([]byte{0, 6})
@@ -369,4 +375,15 @@ func tftpSendOptionsAck(options *map[string]string, conn *net.UDPConn) {
 		buf.WriteByte(0)
 	}
 	conn.Write(buf.Bytes())
+
+	if opcode == 1 {
+		zero, err := tftpReceiveAck(conn)
+		if zero != 0 {
+			err = fmt.Errorf("client did not acknowledge acknlowledged option")
+		}
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+	}
 }
