@@ -8,9 +8,10 @@ import (
 
 var (
 	discard = flag.Bool("discard", false, "accept transfers but don't actually write them to disk")
+	port    = flag.Int("port", 69, "UDP port to listen on")
 )
 
 func main() {
 	flag.Parse()
-	tftp.Listen(*discard)
+	tftp.Listen(*discard, *port)
 }

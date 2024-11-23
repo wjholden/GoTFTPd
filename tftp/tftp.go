@@ -21,10 +21,10 @@ var discard_data bool = false
 // https://datatracker.ietf.org/doc/html/rfc1784
 // https://datatracker.ietf.org/doc/html/rfc2347
 // https://datatracker.ietf.org/doc/html/rfc2349
-func Listen(discard bool) {
+func Listen(discard bool, port int) {
 	discard_data = discard
 	fmt.Println("Starting TFTP server...")
-	laddr := &net.UDPAddr{IP: net.IPv6zero, Port: 69, Zone: ""}
+	laddr := &net.UDPAddr{IP: net.IPv6zero, Port: port, Zone: ""}
 	conn, err := net.ListenUDP("udp", laddr)
 	if err != nil {
 		log.Fatal(err)
