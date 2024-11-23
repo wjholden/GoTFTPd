@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -76,7 +77,16 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 	}
 	defer conn.Close()
 
-	// identify the request type
+	// The shortest possible TFTP packet is pretty short. It has to contain
+	// an opcode (2), filename (at least 1 byte + null terminator), and
+	// transfer mode (5 + null terminator).
+	if len(req) < 2+1+1+5+1 {
+		err = fmt.Errorf("runt request is too short")
+		fmt.Fprintln(os.Stderr, err)
+		tftpSendError(err, ERR_UNDEFINED, conn)
+		return
+	}
+
 	opcode := OpCode(binary.BigEndian.Uint16(req[0:2]))
 
 	req_strings := bytes.Split(req[2:], []byte{0})
@@ -85,16 +95,26 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 	}
 
 	if len(req_strings) < 2 {
-		tftpSendError(fmt.Errorf("request missing filename or mode"), ERR_ILLEGAL_OP, conn)
+		err = fmt.Errorf("request missing filename or mode")
+		fmt.Fprintln(os.Stderr, err)
+		tftpSendError(err, ERR_ILLEGAL_OP, conn)
 		return
 	}
 
-	filename := string(req_strings[0])
+	filename := "./" + string(req_strings[0])
 	mode := string(req_strings[1])
 	blocksize := 512
-	options := make(map[string]string)
 	timeout := 1 * time.Second
+	tsize := 0
 
+	if mode != "octet" {
+		err = fmt.Errorf("server only supports octet mode")
+		fmt.Fprintln(os.Stderr, err)
+		tftpSendError(err, ERR_ILLEGAL_OP, conn)
+		return
+	}
+
+	options := make(map[string]string)
 	if len(req_strings) > 2 {
 		fmt.Printf("TFTP request from %s includes options:\n", conn.RemoteAddr().String())
 		for i := 2; i < len(req_strings); i += 2 {
@@ -116,6 +136,8 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 				} else {
 					timeout = time.Duration(t) * time.Second
 				}
+			case "tsize":
+				tsize, err = strconv.Atoi(value)
 			default:
 				fmt.Println(" (ignored)")
 				continue
@@ -133,11 +155,19 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 
 	switch opcode {
 	case OPCODE_RRQ:
-		fmt.Println("read request from", addr.String(), filename, mode)
+		fmt.Printf("RRQ from %s for %s\n", addr.String(), filename)
+
+		if _, ok := options["tsize"]; ok {
+			info, err := os.Stat(filename)
+			if err != nil {
+				delete(options, "tsize")
+			}
+			options["tsize"] = strconv.FormatInt(info.Size(), 10)
+		}
 
 		tftpSendOptionsAck(&options, opcode, conn)
 
-		err = send(filename, conn, blocksize)
+		err = send(filename, conn, blocksize, timeout)
 		if err != nil {
 			fmt.Println("Error sending:", err)
 		}
@@ -145,15 +175,15 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 		if read_only {
 			err = fmt.Errorf("this server is read-only")
 			tftpSendError(err, ERR_ACCESS_VIOLATION, conn)
-			fmt.Println("Rejected write from", addr.String(), "(server is in read-only mode).")
+			fmt.Println("Rejected WRQ from", addr.String(), "(server is in read-only mode).")
 			return
 		}
 
-		fmt.Println("write request from", addr.String())
+		fmt.Printf("WRQ from %s for %s\n", addr.String(), filename)
 
 		tftpSendOptionsAck(&options, opcode, conn)
 
-		err = receive(filename, conn, blocksize, timeout)
+		err = receive(filename, conn, blocksize, timeout, tsize)
 		if err != nil {
 			fmt.Println("Error receiving:", err)
 		}
@@ -168,10 +198,8 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 	}
 }
 
-func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Duration) error {
-	var prefixed_filename = "./" + filename // force relative path, is this enough?
-
-	if _, err := os.Stat(prefixed_filename); err == nil {
+func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Duration, tsize int) error {
+	if _, err := os.Stat(filename); err == nil {
 		// file already exists
 		err = fmt.Errorf("%s already exists", filename)
 		fmt.Println(err)
@@ -187,13 +215,19 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 	var destination io.Writer
 
 	if !discard_data {
-		file, err := os.Create(prefixed_filename)
+		file, err := os.Create(filename)
 		if err != nil {
 			tftpSendError(err, ERR_UNDEFINED, conn)
 			return err
 		}
+
+		if err = file.Truncate(int64(tsize)); err != nil {
+			// Truncation failed? This should not happen, but maybe the disk is full.
+			tftpSendError(err, ERR_UNDEFINED, conn)
+			return err
+		}
+
 		defer file.Close()
-		fmt.Printf("Receiving %s...\n", filename)
 		destination = file
 	} else {
 		destination = io.Discard
@@ -263,7 +297,7 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 	}
 	fmt.Printf("%s %s from %s (%.2f %s)\n",
 		verb,
-		prefixed_filename,
+		filename,
 		conn.RemoteAddr().String(),
 		speed_rate,
 		speed_unit)
@@ -274,11 +308,10 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 	return nil
 }
 
-func send(filename string, conn *net.UDPConn, blocksize int) error {
+func send(filename string, conn *net.UDPConn, blocksize int, timeout time.Duration) error {
 	var buf bytes.Buffer
 
-	prefixed_filename := "./" + filename
-	file, err := os.Open(prefixed_filename)
+	file, err := os.Open(filename)
 	if err != nil {
 		tftpSendError(err, ERR_NOT_FOUND, conn)
 		return err
@@ -291,6 +324,7 @@ func send(filename string, conn *net.UDPConn, blocksize int) error {
 	write_buffer := make([]byte, blocksize)
 	hash := md5.New()
 	writer := io.MultiWriter(&buf, hash)
+	retries := 0
 
 	for i := uint16(1); ; {
 		n, err := file.ReadAt(write_buffer, int64((i-1))*int64(blocksize))
@@ -307,10 +341,25 @@ func send(filename string, conn *net.UDPConn, blocksize int) error {
 		bytes_sent += n
 		packets_sent++
 
+		conn.SetReadDeadline(time.Now().Add(timeout))
 		block, err2 := tftpReceiveAck(conn)
 		if err2 != nil {
-			fmt.Println(err2)
-			continue
+			if strings.Contains(err2.Error(), "i/o timeout") {
+				// Retry the transmission 6 times before giving up.
+				if retries < 6 {
+					retries++
+				} else {
+					tftpSendError(err2, ERR_UNDEFINED, conn)
+					return err2
+				}
+			} else if strings.Contains(err2.Error(), "TFTP error") {
+				// If we got an explicit TFTP error then stop immediately.
+				return err2
+			} else {
+				// We got some other error that we can try to recover from.
+				fmt.Println(err2)
+				continue
+			}
 		}
 
 		if block == i {
@@ -331,7 +380,7 @@ func send(filename string, conn *net.UDPConn, blocksize int) error {
 		hex.EncodeToString(hash.Sum(nil)))
 	fmt.Println("\033[0m") // reset color
 
-	return file.Close()
+	return nil
 }
 
 func speed(bytes int, start time.Time) (rate float64, unit string) {
