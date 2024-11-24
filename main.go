@@ -14,5 +14,6 @@ var (
 
 func main() {
 	flag.Parse()
-	tftp.Listen(*discard, *port, *readonly)
+	s := tftp.TftpNode{Port: *port, DiscardData: *discard, ReadOnly: *readonly}
+	s.Listen()
 }

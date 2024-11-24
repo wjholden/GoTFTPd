@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"net"
@@ -14,9 +15,6 @@ import (
 	"strings"
 	"time"
 )
-
-var discard_data bool = false
-var read_only bool = false
 
 type ErrorCode uint16
 
@@ -41,21 +39,26 @@ const (
 	OPCODE_ERROR OpCode = 5
 )
 
+type TftpNode struct {
+	Port        int
+	DiscardData bool
+	ReadOnly    bool
+}
+
 // https://datatracker.ietf.org/doc/html/rfc1350
 // https://datatracker.ietf.org/doc/html/rfc1785
 // https://datatracker.ietf.org/doc/html/rfc1784
 // https://datatracker.ietf.org/doc/html/rfc2347
 // https://datatracker.ietf.org/doc/html/rfc2349
-func Listen(discard bool, port int, readonly bool) {
-	discard_data = discard
-	read_only = readonly
-	fmt.Println("Starting TFTP server...")
-	laddr := &net.UDPAddr{IP: net.IPv6zero, Port: port, Zone: ""}
+func (t *TftpNode) Listen() {
+	laddr := &net.UDPAddr{IP: net.IPv6zero, Port: t.Port, Zone: ""}
 	conn, err := net.ListenUDP("udp", laddr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer conn.Close()
+
+	fmt.Println("Started TFTP server on", laddr.String())
 
 	for {
 		buf := make([]byte, 1500)
@@ -66,11 +69,11 @@ func Listen(discard bool, port int, readonly bool) {
 		}
 
 		buf = buf[0:n]
-		go handleClient(buf, addr)
+		go t.handleClient(buf, addr)
 	}
 }
 
-func handleClient(req []byte, addr *net.UDPAddr) {
+func (t *TftpNode) handleClient(req []byte, addr *net.UDPAddr) {
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
 		log.Fatal(err)
@@ -81,9 +84,9 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 	// an opcode (2), filename (at least 1 byte + null terminator), and
 	// transfer mode (5 + null terminator).
 	if len(req) < 2+1+1+5+1 {
-		err = fmt.Errorf("runt request is too short")
+		err = fmt.Errorf("runt request")
 		fmt.Fprintln(os.Stderr, err)
-		tftpSendError(err, ERR_UNDEFINED, conn)
+		t.tftpSendError(err, ERR_UNDEFINED, conn)
 		return
 	}
 
@@ -97,7 +100,7 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 	if len(req_strings) < 2 {
 		err = fmt.Errorf("request missing filename or mode")
 		fmt.Fprintln(os.Stderr, err)
-		tftpSendError(err, ERR_ILLEGAL_OP, conn)
+		t.tftpSendError(err, ERR_ILLEGAL_OP, conn)
 		return
 	}
 
@@ -107,10 +110,10 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 	timeout := 1 * time.Second
 	tsize := 0
 
-	if mode != "octet" {
-		err = fmt.Errorf("server only supports octet mode")
+	if mode != "octet" && mode != "binary" {
+		err = fmt.Errorf("server only supports octet mode") // but we will also accept "binary"
 		fmt.Fprintln(os.Stderr, err)
-		tftpSendError(err, ERR_ILLEGAL_OP, conn)
+		t.tftpSendError(err, ERR_ILLEGAL_OP, conn)
 		return
 	}
 
@@ -144,7 +147,7 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 			}
 
 			if err != nil {
-				tftpSendError(err, ERR_UNDEFINED, conn)
+				t.tftpSendError(err, ERR_UNDEFINED, conn)
 				fmt.Println(" (error)")
 			} else {
 				options[key] = value
@@ -165,66 +168,66 @@ func handleClient(req []byte, addr *net.UDPAddr) {
 			options["tsize"] = strconv.FormatInt(info.Size(), 10)
 		}
 
-		tftpSendOptionsAck(&options, opcode, conn)
+		t.tftpSendOptionsAck(&options, opcode, conn)
 
-		err = send(filename, conn, blocksize, timeout)
+		_, err = t.send(filename, conn, blocksize, timeout)
 		if err != nil {
 			fmt.Println("Error sending:", err)
 		}
 	case OPCODE_WRQ:
-		if read_only {
+		if t.ReadOnly {
 			err = fmt.Errorf("this server is read-only")
-			tftpSendError(err, ERR_ACCESS_VIOLATION, conn)
+			t.tftpSendError(err, ERR_ACCESS_VIOLATION, conn)
 			fmt.Println("Rejected WRQ from", addr.String(), "(server is in read-only mode).")
 			return
 		}
 
 		fmt.Printf("WRQ from %s for %s\n", addr.String(), filename)
 
-		tftpSendOptionsAck(&options, opcode, conn)
+		t.tftpSendOptionsAck(&options, opcode, conn)
 
-		err = receive(filename, conn, blocksize, timeout, tsize)
+		_, err = t.receive(filename, conn, blocksize, timeout, tsize)
 		if err != nil {
 			fmt.Println("Error receiving:", err)
 		}
 	case OPCODE_DATA, OPCODE_ACK:
 		// We've received a data or acknowledgement that isn't consistent
 		// with the server's state.
-		tftpSendError(fmt.Errorf("who are you?"), ERR_UNKNOWN_TID, conn)
+		t.tftpSendError(fmt.Errorf("who are you?"), ERR_UNKNOWN_TID, conn)
 		return
 	default:
-		tftpSendError(fmt.Errorf("unexpected opcode (%d)", opcode), ERR_ILLEGAL_OP, conn)
+		t.tftpSendError(fmt.Errorf("unexpected opcode (%d)", opcode), ERR_ILLEGAL_OP, conn)
 		return
 	}
 }
 
-func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Duration, tsize int) error {
+func (t *TftpNode) receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Duration, tsize int) (hash.Hash, error) {
 	if _, err := os.Stat(filename); err == nil {
 		// file already exists
 		err = fmt.Errorf("%s already exists", filename)
 		fmt.Println(err)
-		tftpSendError(err, ERR_ALREADY_EXISTS, conn)
-		return err
+		t.tftpSendError(err, ERR_ALREADY_EXISTS, conn)
+		return nil, err
 	}
 
 	start_time := time.Now()
 	var blocks_read uint16 = 0
 	bytes_read := 0
-	tftpSendAck(blocks_read, conn)
+	t.tftpSendAck(blocks_read, conn)
 
 	var destination io.Writer
 
-	if !discard_data {
+	if !t.DiscardData {
 		file, err := os.Create(filename)
 		if err != nil {
-			tftpSendError(err, ERR_UNDEFINED, conn)
-			return err
+			t.tftpSendError(err, ERR_UNDEFINED, conn)
+			return nil, err
 		}
 
 		if err = file.Truncate(int64(tsize)); err != nil {
 			// Truncation failed? This should not happen, but maybe the disk is full.
-			tftpSendError(err, ERR_UNDEFINED, conn)
-			return err
+			t.tftpSendError(err, ERR_UNDEFINED, conn)
+			return nil, err
 		}
 
 		defer file.Close()
@@ -261,12 +264,12 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 
 			if err != nil {
 				fmt.Println(err)
-				tftpSendError(err, ERR_UNDEFINED, conn)
+				t.tftpSendError(err, ERR_UNDEFINED, conn)
 				continue
 			}
 
 			// we've received, now acknowledge receipt.
-			tftpSendAck(block, conn)
+			t.tftpSendAck(block, conn)
 			blocks_read++
 			bytes_read += n
 
@@ -275,14 +278,14 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 			}
 		} else if block <= blocks_read {
 			// duplicate packet?
-			tftpSendAck(block, conn)
+			t.tftpSendAck(block, conn)
 			bytes_read += n
 			continue
 		} else {
 			err = fmt.Errorf("received %s block %d, expected %d",
 				filename, block, blocks_read+1)
 			fmt.Println(err)
-			tftpSendError(err, ERR_UNDEFINED, conn)
+			t.tftpSendError(err, ERR_UNDEFINED, conn)
 			continue
 		}
 	}
@@ -290,7 +293,7 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 	fmt.Println("\033[34m") // blue
 	speed_rate, speed_unit := speed(bytes_read, start_time)
 	var verb string
-	if discard_data {
+	if t.DiscardData {
 		verb = "Discarded"
 	} else {
 		verb = "Wrote"
@@ -305,16 +308,16 @@ func receive(filename string, conn *net.UDPConn, blocksize int, timeout time.Dur
 		hex.EncodeToString(hash.Sum(nil)))
 	fmt.Println("\033[0m") // reset
 
-	return nil
+	return hash, nil
 }
 
-func send(filename string, conn *net.UDPConn, blocksize int, timeout time.Duration) error {
+func (s *TftpNode) send(filename string, conn *net.UDPConn, blocksize int, timeout time.Duration) (hash.Hash, error) {
 	var buf bytes.Buffer
 
 	file, err := os.Open(filename)
 	if err != nil {
-		tftpSendError(err, ERR_NOT_FOUND, conn)
-		return err
+		s.tftpSendError(err, ERR_NOT_FOUND, conn)
+		return nil, err
 	}
 	defer file.Close()
 
@@ -330,10 +333,10 @@ func send(filename string, conn *net.UDPConn, blocksize int, timeout time.Durati
 		n, err := file.ReadAt(write_buffer, int64((i-1))*int64(blocksize))
 		if err != nil && err != io.EOF {
 			fmt.Printf("I/O problem during transfer: %s.", err)
-			tftpSendError(err, ERR_UNDEFINED, conn)
-			return err
+			s.tftpSendError(err, ERR_UNDEFINED, conn)
+			return nil, err
 		}
-		buf.Write([]byte{0, 3})                         // TFTP data packet
+		buf.Write([]byte{0, byte(OPCODE_DATA)})         // TFTP data packet
 		buf.Write([]byte{byte(i >> 8), byte(0xff & i)}) // block #
 		writer.Write(write_buffer[:n])
 		conn.Write(buf.Bytes())
@@ -342,19 +345,19 @@ func send(filename string, conn *net.UDPConn, blocksize int, timeout time.Durati
 		packets_sent++
 
 		conn.SetReadDeadline(time.Now().Add(timeout))
-		block, err2 := tftpReceiveAck(conn)
+		block, err2 := s.tftpReceiveAck(conn)
 		if err2 != nil {
 			if strings.Contains(err2.Error(), "i/o timeout") {
 				// Retry the transmission 6 times before giving up.
 				if retries < 6 {
 					retries++
 				} else {
-					tftpSendError(err2, ERR_UNDEFINED, conn)
-					return err2
+					s.tftpSendError(err2, ERR_UNDEFINED, conn)
+					return nil, err2
 				}
 			} else if strings.Contains(err2.Error(), "TFTP error") {
 				// If we got an explicit TFTP error then stop immediately.
-				return err2
+				return nil, err2
 			} else {
 				// We got some other error that we can try to recover from.
 				fmt.Println(err2)
@@ -380,7 +383,7 @@ func send(filename string, conn *net.UDPConn, blocksize int, timeout time.Durati
 		hex.EncodeToString(hash.Sum(nil)))
 	fmt.Println("\033[0m") // reset color
 
-	return nil
+	return hash, nil
 }
 
 func speed(bytes int, start time.Time) (rate float64, unit string) {
@@ -398,14 +401,14 @@ func speed(bytes int, start time.Time) (rate float64, unit string) {
 	return
 }
 
-func tftpSendError(err error, errcode ErrorCode, conn *net.UDPConn) {
+func (s *TftpNode) tftpSendError(err error, errcode ErrorCode, conn *net.UDPConn) {
 	var buf bytes.Buffer
 	buf.Write([]byte{0, 5, byte(errcode >> 8), byte(errcode & 0xff)}) // TFTP error packet with no defined error code
 	buf.Write([]byte(fmt.Sprint(err)))
 	conn.Write(buf.Bytes())
 }
 
-func tftpReceiveAck(conn *net.UDPConn) (block uint16, err error) {
+func (s *TftpNode) tftpReceiveAck(conn *net.UDPConn) (block uint16, err error) {
 	read_buffer := make([]byte, 1500)
 	n, _, err := conn.ReadFrom(read_buffer)
 	if err != nil {
@@ -430,14 +433,14 @@ func tftpReceiveAck(conn *net.UDPConn) (block uint16, err error) {
 	return
 }
 
-func tftpSendAck(block uint16, conn *net.UDPConn) {
+func (s *TftpNode) tftpSendAck(block uint16, conn *net.UDPConn) {
 	var buf bytes.Buffer
 	buf.Write([]byte{0, 4})
 	buf.Write([]byte{byte(block >> 8), byte(0xff & block)})
 	conn.Write(buf.Bytes())
 }
 
-func tftpSendOptionsAck(options *map[string]string, opcode OpCode, conn *net.UDPConn) {
+func (s *TftpNode) tftpSendOptionsAck(options *map[string]string, opcode OpCode, conn *net.UDPConn) {
 	if len(*options) == 0 {
 		return
 	}
@@ -454,7 +457,7 @@ func tftpSendOptionsAck(options *map[string]string, opcode OpCode, conn *net.UDP
 	conn.Write(buf.Bytes())
 
 	if opcode == OPCODE_RRQ {
-		zero, err := tftpReceiveAck(conn)
+		zero, err := s.tftpReceiveAck(conn)
 		if zero != 0 {
 			err = fmt.Errorf("client did not acknowledge acknlowledged option")
 		}
