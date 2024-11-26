@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 
-	"github.com/wjholden/GoTFTPd/tftp"
+	tftp "github.com/wjholden/GoTFTPd/internal"
 )
 
 var (
@@ -14,6 +14,9 @@ var (
 
 func main() {
 	flag.Parse()
-	s := tftp.TftpNode{Port: *port, DiscardData: *discard, ReadOnly: *readonly}
+	s := tftp.TftpServer{TftpNode: tftp.TftpNode{
+		DiscardData: *discard,
+		ReadOnly:    *readonly},
+		Port: *port}
 	s.Listen()
 }
